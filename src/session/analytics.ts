@@ -14,6 +14,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
+import { ensureSessionEventsSchema } from "./db.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
 
 function semverNewer(a: string, b: string): boolean {
@@ -1142,6 +1143,25 @@ export function getRealBytesStats(opts: {
   sessionsDir?: string;
   worktreeHash?: string;
   /**
+   * v1.0.148 follow-up (Bug E+F): when set, the function aggregates across
+   * EVERY session whose `session_meta.project_dir` matches this value, not
+   * just one session_id. Resolves the per-conversation under-attribution:
+   * one Claude Code conversation typically spans many session_ids (resume
+   * cycles, /compact rebirths, PID sub-process sessions spawned by
+   * ctx_execute), so a single-session_id filter loses the sandbox-burst
+   * bytes_avoided that all live under the conversation's cwd.
+   *
+   * Uses a META subquery (`session_id IN (SELECT session_id FROM
+   * session_meta WHERE project_dir = ?)`), then sums ALL events for
+   * matching sessions regardless of their event-level project_dir
+   * (sandbox-burst events write `project_dir = ''` even when the
+   * META row carries the parent cwd — see Bug F).
+   *
+   * Mutually exclusive with `sessionId`. When both are set, `sessionId`
+   * wins for back-compat.
+   */
+  projectDir?: string;
+  /**
    * v1.0.133 Slice 3: when set alongside `sessionId`, the function joins
    * the FTS5 content DB at this path and folds chunk bytes into
    * `bytesAvoided` + `totalSavedTokens` + `contentBytes`. Render-time
@@ -1190,6 +1210,19 @@ export function getRealBytesStats(opts: {
   // don't need to type-narrow per row.
   for (const file of dbFiles) {
     const dbPath = join(sessionsDir, file);
+    // v1.0.148 hotfix: historical DBs were created with pre-v1.0.130
+    // schema (no bytes_avoided / bytes_returned / project_dir columns).
+    // The SELECT below references those columns, so without an in-place
+    // migration the prepare() throws and the surrounding catch silently
+    // skips the WHOLE DB — losing even the LENGTH(data) signal. Run the
+    // shared migration helper before opening readonly. Idempotent: a
+    // PRAGMA check inside the helper short-circuits when the DB is
+    // already current, so post-first-read calls are cheap.
+    ensureSessionEventsSchema(dbPath, DatabaseCtor as unknown as new (path: string, opts?: { readonly?: boolean }) => {
+      pragma: (q: string) => Array<{ name: string }>;
+      exec: (sql: string) => void;
+      close: () => void;
+    });
     try {
       const sdb = new DatabaseCtor(dbPath, { readonly: true });
       try {
@@ -1212,6 +1245,39 @@ export function getRealBytesStats(opts: {
             const snap = sdb.prepare(
               "SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes FROM session_resume WHERE session_id = ?",
             ).get(opts.sessionId) as { bytes: number } | undefined;
+            if (snap?.bytes) snapshotBytes += Number(snap.bytes);
+          } catch { /* old schema */ }
+        } else if (opts.projectDir) {
+          // Bug E+F: META-scoped aggregation. Take every session_id whose
+          // session_meta.project_dir matches, then sum ALL of those
+          // sessions' events regardless of the events' own project_dir
+          // (sandbox-burst PID sessions write empty event-level project_dir
+          // even when their META carries the parent cwd).
+          const row = sdb.prepare(
+            `SELECT
+               COALESCE(SUM(LENGTH(data)), 0)   AS data_bytes,
+               COALESCE(SUM(bytes_avoided), 0)  AS bytes_avoided,
+               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+             FROM session_events
+             WHERE session_id IN (
+               SELECT session_id FROM session_meta WHERE project_dir = ?
+             )`,
+          ).get(opts.projectDir) as
+            | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
+            | undefined;
+          if (row) {
+            eventDataBytes += Number(row.data_bytes ?? 0);
+            bytesAvoided   += Number(row.bytes_avoided ?? 0);
+            bytesReturned  += Number(row.bytes_returned ?? 0);
+          }
+          try {
+            const snap = sdb.prepare(
+              `SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes
+               FROM session_resume
+               WHERE session_id IN (
+                 SELECT session_id FROM session_meta WHERE project_dir = ?
+               )`,
+            ).get(opts.projectDir) as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
         } else {
@@ -1962,35 +2028,44 @@ function renderNarrative5Section(args: {
   }
   out.push("");
 
-  // Without/With bars — measured from real per-event bytes_returned / bytes_avoided.
+  // Without/With bars — strict compression (v1.0.148, Bug G / ADR-0004).
   //
-  // Honest definitions (v1.0.134 SLICE B — eventDataBytes floor):
-  //   Without = bytes the model WOULD have re-seen with no filtering
-  //           = bytes_avoided + bytes_returned + eventDataBytes
+  // Honest definitions:
+  //   Without = bytes the model WOULD have re-seen if context-mode
+  //             had not diverted them
+  //           = bytesAvoided + bytesReturned
   //   With    = bytes the model ACTUALLY re-saw after context-mode
-  //           = bytes_returned + eventDataBytes
+  //           = max(1, bytesReturned)
   //
-  // Why eventDataBytes belongs on BOTH sides:
-  //   `eventDataBytes` is the raw payload captured by the hook (tool args,
-  //   prompt body, etc). Those bytes were "kept out" — never inflated back
-  //   into context — but they still represent real measured signal. Pre-fix
-  //   the formula was `with = max(1, bytesReturned)`, which collapsed to 1
-  //   whenever the conversation hadn't accumulated any re-served bytes yet
-  //   (early in a session, or for tool-heavy work that never re-hits index).
-  //   That produced a degenerate ~100% kept-out bar even when the only
-  //   honest signal we had was a few KB of event payloads.
+  // Why eventDataBytes is excluded from this ratio:
+  //   `eventDataBytes` is the raw hook payload (tool args, prompt
+  //   body) we captured for the knowledge base. Those bytes are
+  //   analytics infrastructure — they NEVER enter the model context
+  //   window. Including them on either side (as v1.0.134 SLICE B did
+  //   to dodge a degenerate 100% bar) misrepresents context cost.
+  //   SLICE B was an incidental fix that crushed the displayed
+  //   percentage from ~95% (the true compression ratio) to ~56% on
+  //   live conversations. eventDataBytes is rendered in Section 2
+  //   (captures count), not in this Section 1 Without/With bar.
   //
-  // No fallback to heuristic. If the schema has zero signal for this
-  // conversation (no hook ever populated any of the three columns),
-  // the section is skipped entirely. Honesty over decoration.
+  // Empty-state branch:
+  //   If neither bytesAvoided nor bytesReturned has been measured yet
+  //   (early in a session, schema-migration recovery in progress, or
+  //   tool-heavy work that hasn't re-hit the index), we do NOT draw
+  //   a degenerate 0% / 100% bar. We emit one honest hint line and
+  //   skip the bar — honesty over decoration.
   const realConv = realBytes?.conversation;
   const measuredAvoided  = realConv?.bytesAvoided   ?? 0;
   const measuredReturned = realConv?.bytesReturned  ?? 0;
-  const measuredEvent    = realConv?.eventDataBytes ?? 0;
 
-  if (measuredAvoided + measuredReturned + measuredEvent > 0) {
-    const convBytesWithout  = measuredAvoided + measuredReturned + measuredEvent;
-    const convBytesWith     = Math.max(1, measuredReturned + measuredEvent);
+  if (measuredAvoided + measuredReturned === 0) {
+    // No measurable redirect activity yet — captures may exist, but
+    // nothing has been diverted from the model context window.
+    out.push("  No measurable redirect activity captured yet — bars will appear once context-mode diverts its first payload.");
+    out.push("");
+  } else {
+    const convBytesWithout  = measuredAvoided + measuredReturned;
+    const convBytesWith     = Math.max(1, measuredReturned);
     const convTokensWithout = Math.max(1, Math.floor(convBytesWithout / 4));
     const convTokensWith    = Math.max(1, Math.floor(convBytesWith    / 4));
     const withoutBar = dataBar(convTokensWithout, convTokensWithout, 32);

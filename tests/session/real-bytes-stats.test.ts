@@ -27,9 +27,15 @@ import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, test } from "vitest";
 import { SessionDB } from "../../src/session/db.js";
 import {
+  formatReport,
   getContentBytesForSession,
   getMultiAdapterRealBytesStats,
   getRealBytesStats,
+} from "../../src/session/analytics.js";
+import type {
+  ConversationStats,
+  FullReport,
+  RealBytesStats,
 } from "../../src/session/analytics.js";
 import { ContentStore } from "../../src/store.js";
 
@@ -372,5 +378,424 @@ describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
     // adapter's content DB, this asserts ~7_000 — well under 16_000.
     expect(r.contentBytes).toBeGreaterThan(16_000);
     expect(r.contentBytes).toBeLessThan(22_000);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// v1.0.148 hotfix — lazy schema migration in the aggregator.
+//
+// Bug A + C cascade: pre-v1.0.130 session DBs on disk have no
+// `bytes_avoided`, `bytes_returned`, or `project_dir` columns. The
+// aggregator's combined SUM query references those columns, so SQLite
+// throws "no such column" at prepare() time and the surrounding catch
+// in getRealBytesStats silently skips the WHOLE DB — even the
+// LENGTH(data) signal is lost, not just the missing columns. On the
+// reporter's machine 131 of 197 historical DBs were affected.
+//
+// Fix: aggregator now calls ensureSessionEventsSchema(dbPath, ctor)
+// before opening each DB readonly. Idempotent, ADR-0001 compatible
+// (no EXCLUSIVE pragma). Self-healing — every stats call migrates
+// any legacy DBs it scans.
+//
+// These tests pin the behavioural guarantee through the public
+// getRealBytesStats API (no implementation coupling): a legacy-schema
+// DB on disk must still contribute LENGTH(data) signal, and the
+// migration must be observable as columns added in place.
+// ──────────────────────────────────────────────────────────────────────
+describe("aggregator schema-migration recovery (#683 follow-up, v1.0.148)", () => {
+  /**
+   * Build a pre-v1.0.130 session DB on disk — no `bytes_avoided`,
+   * `bytes_returned`, `project_dir`, or attribution columns. Mirrors
+   * the schema actually observed on real upgraded installs. Uses raw
+   * SQL via better-sqlite3 to bypass the SessionDB ctor's
+   * auto-migration.
+   */
+  async function createLegacySessionDb(
+    dbPath: string,
+    sessionId: string,
+    events: Array<{ data: string }>,
+  ): Promise<void> {
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE session_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          type TEXT NOT NULL,
+          category TEXT NOT NULL,
+          priority INTEGER NOT NULL DEFAULT 2,
+          data TEXT NOT NULL,
+          source_hook TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          data_hash TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE session_meta (
+          session_id TEXT PRIMARY KEY,
+          project_dir TEXT NOT NULL,
+          started_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_event_at TEXT,
+          event_count INTEGER NOT NULL DEFAULT 0,
+          compact_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE session_resume (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL UNIQUE,
+          snapshot TEXT NOT NULL,
+          event_count INTEGER NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed INTEGER NOT NULL DEFAULT 0
+        );
+      `);
+      const ins = db.prepare(
+        `INSERT INTO session_events (session_id, type, category, data, source_hook) VALUES (?, ?, ?, ?, ?)`,
+      );
+      let i = 0;
+      for (const e of events) {
+        ins.run(sessionId, "tool_use", "file", `${e.data}#${i++}`, "test");
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  /** Read the column set from a session DB. Used to assert pre/post migration state. */
+  async function readSessionEventsColumns(dbPath: string): Promise<Set<string>> {
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const colInfo = db.pragma("table_xinfo(session_events)") as Array<{ name: string }>;
+      return new Set(colInfo.map((c) => c.name));
+    } finally {
+      db.close();
+    }
+  }
+
+  test("recovers LENGTH(data) signal from a legacy-schema DB (the regression v1.0.148 fixes)", async () => {
+    const dir = mkSessionsDir();
+    const sid = `sess-${randomUUID()}`;
+    const dbPath = dbPathFor(dir, "legacy0123456789");
+
+    await createLegacySessionDb(dbPath, sid, [
+      { data: "src/app.ts captured by hook" },
+      { data: "src/another.ts more bytes for the sum" },
+    ]);
+
+    // Confirm the seed DB has the pre-v1.0.130 legacy schema.
+    const colsBefore = await readSessionEventsColumns(dbPath);
+    expect(colsBefore.has("bytes_avoided")).toBe(false);
+    expect(colsBefore.has("bytes_returned")).toBe(false);
+    expect(colsBefore.has("project_dir")).toBe(false);
+
+    // ACT — the aggregator call that triggered the original regression
+    // (pre-fix: prepare() throws on missing column, catch skips the DB,
+    // result.eventDataBytes returns 0 even though LENGTH(data) > 0).
+    const r = getRealBytesStats({ sessionId: sid, sessionsDir: dir });
+
+    // ASSERT — LENGTH(data) signal recovered. Two events, each ~27-38 chars
+    // plus the `#N` dedup suffix; the assertion guards against the
+    // identity-collapse failure mode (eventDataBytes == 0) without
+    // pinning fragile exact byte counts.
+    expect(r.eventDataBytes).toBeGreaterThan(40);
+    expect(r.eventDataBytes).toBeLessThan(500);
+    // Legacy events never recorded these — 0 by absence, not by bug.
+    expect(r.bytesAvoided).toBe(0);
+    expect(r.bytesReturned).toBe(0);
+  });
+
+  test("migrates the DB schema in-place on first read (columns now exist on disk)", async () => {
+    const dir = mkSessionsDir();
+    const sid = `sess-${randomUUID()}`;
+    const dbPath = dbPathFor(dir, "legacymigrate56a");
+
+    await createLegacySessionDb(dbPath, sid, [{ data: "one event" }]);
+
+    const colsBefore = await readSessionEventsColumns(dbPath);
+    expect(colsBefore.has("bytes_avoided")).toBe(false);
+    expect(colsBefore.has("project_dir")).toBe(false);
+
+    // ACT — aggregator call triggers ensureSessionEventsSchema.
+    getRealBytesStats({ sessionsDir: dir });
+
+    // ASSERT — the disk DB now carries all five post-v1.0.130 columns.
+    const colsAfter = await readSessionEventsColumns(dbPath);
+    expect(colsAfter.has("project_dir")).toBe(true);
+    expect(colsAfter.has("attribution_source")).toBe(true);
+    expect(colsAfter.has("attribution_confidence")).toBe(true);
+    expect(colsAfter.has("bytes_avoided")).toBe(true);
+    expect(colsAfter.has("bytes_returned")).toBe(true);
+  });
+
+  test("migration is idempotent — second aggregator call adds no columns, no error", async () => {
+    const dir = mkSessionsDir();
+    const sid = `sess-${randomUUID()}`;
+    const dbPath = dbPathFor(dir, "legacyidempotent");
+
+    await createLegacySessionDb(dbPath, sid, [{ data: "event" }]);
+
+    // First call migrates.
+    getRealBytesStats({ sessionsDir: dir });
+    const colsAfterFirst = await readSessionEventsColumns(dbPath);
+    expect(colsAfterFirst.has("bytes_avoided")).toBe(true);
+
+    // Second call must not throw and must not add new columns.
+    expect(() => getRealBytesStats({ sessionsDir: dir })).not.toThrow();
+    const colsAfterSecond = await readSessionEventsColumns(dbPath);
+    expect(colsAfterSecond.size).toBe(colsAfterFirst.size);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Bug E+F (v1.0.148 follow-up) — per-conversation aggregator MUST scope
+// by project_dir on session_META, not by a single session_id.
+//
+// Empirical finding from the field: one Claude Code conversation
+// produces dozens of session_ids (resume cycles, /compact rebirths,
+// PID sub-process sessions launched by ctx_execute). The aggregator's
+// existing per-session filter caught only the top-level main session,
+// losing every sandbox burst's bytes_avoided. On the reporter's
+// machine: real conversation savings = 56% / 5 MB, displayed = 6% /
+// 168 KB. 49 percentage points of attribution loss.
+//
+// Worse — Bug F nested inside: sandbox-burst PID-session EVENTS write
+// project_dir = '' even though the session_META has the parent cwd.
+// So an event-level project_dir filter would still miss them. The fix
+// scopes via META subquery (`session_id IN (SELECT session_id FROM
+// session_meta WHERE project_dir = ?)`), then sums ALL events for
+// matching sessions regardless of their event-level project_dir.
+//
+// Public API change: getRealBytesStats accepts a new `projectDir`
+// option, mutually exclusive with `sessionId`. When passed, the
+// aggregator uses the META-based subquery.
+// ──────────────────────────────────────────────────────────────────────
+describe("getRealBytesStats projectDir scope (Bug E+F, v1.0.148)", () => {
+  /**
+   * Seed a session with its own DB at a deterministic path. The META
+   * row carries project_dir; events optionally carry their own
+   * project_dir (defaulting to empty string to mirror the
+   * sandbox-burst real-world shape).
+   */
+  function seedSessionWithProjectDir(
+    dir: string,
+    hash: string,
+    sessionId: string,
+    projectDir: string,
+    events: Array<{ data: string; bytesAvoided?: number; bytesReturned?: number; eventProjectDir?: string }>,
+  ): void {
+    const dbPath = dbPathFor(dir, hash);
+    const sdb = new SessionDB({ dbPath });
+    try {
+      sdb.ensureSession(sessionId, projectDir);
+      let i = 0;
+      for (const e of events) {
+        sdb.insertEvent(
+          sessionId,
+          {
+            type: "test",
+            category: "test",
+            priority: 1,
+            data: `${e.data}#${i++}`,
+            // Real bug: sandbox PID-burst events write empty project_dir
+            project_dir: e.eventProjectDir ?? "",
+            attribution_source: "test",
+            attribution_confidence: 1,
+          },
+          "test",
+          undefined,
+          { bytesAvoided: e.bytesAvoided, bytesReturned: e.bytesReturned },
+        );
+      }
+    } finally {
+      sdb.close();
+    }
+  }
+
+  test("sums bytes across every session_id whose META project_dir matches", () => {
+    const dir = mkSessionsDir();
+    const targetProj = "/proj/target";
+    const otherProj = "/proj/other";
+
+    // Session A — main session in target project, bytes_avoided=10_000
+    seedSessionWithProjectDir(dir, "aaa1111111111111", `sess-A-${randomUUID()}`, targetProj, [
+      { data: "main-event", bytesAvoided: 10_000, eventProjectDir: targetProj },
+    ]);
+
+    // Session B — PID sub-process in target project. META has targetProj,
+    // but EVENTS have empty project_dir (the real-world Bug F shape).
+    // bytes_avoided=30_000 — these are the bytes the existing event-level
+    // filter loses.
+    seedSessionWithProjectDir(dir, "bbb2222222222222", `pid-12345`, targetProj, [
+      { data: "sandbox-burst", bytesAvoided: 30_000, eventProjectDir: "" },
+    ]);
+
+    // Session C — different project, MUST be excluded.
+    seedSessionWithProjectDir(dir, "ccc3333333333333", `sess-C-${randomUUID()}`, otherProj, [
+      { data: "noise", bytesAvoided: 99_000, eventProjectDir: otherProj },
+    ]);
+
+    // ACT — new projectDir scope.
+    const r = getRealBytesStats({ projectDir: targetProj, sessionsDir: dir });
+
+    // ASSERT — A (10k, event-level matches) + B (30k, event-level empty
+    // but META matches) summed; C excluded.
+    expect(r.bytesAvoided).toBe(40_000);
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// v1.0.148 — Bug G — strict-compression formula
+//
+// Display formula change. Pre-fix (v1.0.134 SLICE B):
+//   Without = bytesAvoided + bytesReturned + eventDataBytes
+//   With    = max(1, bytesReturned + eventDataBytes)
+// SLICE B added eventDataBytes to both sides to dodge a degenerate
+// 100% bar when bytesReturned was 0. But eventDataBytes is the raw
+// payload captured by the hook (tool args / prompt text) — it is
+// analytics infrastructure that NEVER enters the model context
+// window. Including it inflates the With side and crushes the
+// percentage from ~95% (truth) down to ~56% (display).
+//
+// Post-fix (strict-compression):
+//   if (bytesAvoided + bytesReturned == 0) → skip section, emit hint
+//   else:
+//     Without = bytesAvoided + bytesReturned       (truly diverted)
+//     With    = max(1, bytesReturned)              (truly re-served)
+// eventDataBytes is rendered in Section 2 (captures count), not in
+// the Section 1 Without/With ratio.
+//
+// Empirical baseline (Mert's machine, real DB):
+//   Without ≈ 3.0 MB · With ≈ 140 KB · 95.4% kept out
+// Pre-fix the same DB rendered:
+//   Without ≈ 5.2 MB · With ≈ 2.3 MB · 56% kept out
+// ─────────────────────────────────────────────────────────
+
+const STRICT_OPTS = {
+  cwd:    "/home/u/cm",
+  now:    Date.UTC(2026, 4, 24, 12, 0, 0),
+  locale: "en-TR" as const,
+  tz:     "Europe/Istanbul" as const,
+};
+
+function strictReport(): FullReport {
+  return {
+    savings: {
+      processed_kb: 0, entered_kb: 0, saved_kb: 0, pct: 0, savings_ratio: 0,
+      by_tool: [],
+      total_calls: 5,
+      total_bytes_returned: 1000,
+      kept_out: 5000,
+      total_processed: 0,
+    },
+    session: { id: "strict-test", uptime_min: "3.0" },
+    continuity: { total_events: 0, by_category: [], compact_count: 0, resume_ready: false },
+    projectMemory: { total_events: 0, session_count: 0, by_category: [] },
+  };
+}
+
+function strictConversation(): ConversationStats {
+  return {
+    sessionId: "strict-conv",
+    events: 12,
+    dbCount: 1,
+    daysAlive: 1.5,
+    snapshotBytes: 0,
+    snapshotsConsumed: 0,
+    byCategory: [{ category: "file", count: 1, label: "Files tracked" }],
+    firstEventMs: Date.parse("2026-05-23T08:00:00Z"),
+    lastEventMs:  Date.parse("2026-05-24T11:00:00Z"),
+  };
+}
+
+describe("v1.0.148 Bug G — strict-compression formula (Section 1 Without/With)", () => {
+  test("eventDataBytes is excluded from Without/With; ratio reflects true compression (~95%)", () => {
+    // Mert's empirical conversation row:
+    //   bytesAvoided   = 2,898,000  (tool-call outputs we diverted)
+    //   bytesReturned  =   140,000  (what we actually re-served)
+    //   eventDataBytes = 2,139,000  (raw hook payload — NOT context cost)
+    //
+    // Strict formula:
+    //   Without = 2898000 + 140000  = 3,038,000 ≈ 3.0 MB
+    //   With    = max(1, 140000)    =   140,000 ≈ 140 KB
+    //   % kept  = 1 - 140000/3038000 ≈ 95.4%
+    const realBytes: RealBytesStats = {
+      eventDataBytes: 2_139_000,
+      bytesAvoided:   2_898_000,
+      bytesReturned:    140_000,
+      snapshotBytes:        0,
+      totalSavedTokens: Math.floor((2_898_000 + 140_000) / 4),
+    };
+
+    const text = formatReport(strictReport(), "1.0.148", null, {
+      conversation: strictConversation(),
+      realBytes: { conversation: realBytes },
+      ...STRICT_OPTS,
+    });
+
+    const lines = text.split("\n");
+
+    // Locate the "kept out of context" ratio line.
+    const ratioLine = lines.find((l) => /kept out of context/.test(l));
+    expect(ratioLine, `ratio line missing:\n${text}`).toBeDefined();
+    const m = ratioLine!.match(/(\d+)%\s+kept out of context/);
+    expect(m, `cannot parse ratio: ${ratioLine}`).not.toBeNull();
+    const pct = Number(m![1]);
+
+    // Strict formula → ~95%. SLICE B formula → ~56%. Pre-Bug-E-F → ~6%.
+    // Hard assertion: pct is in the strict-compression band.
+    expect(pct).toBeGreaterThanOrEqual(94);
+    expect(pct).toBeLessThanOrEqual(96);
+
+    // Without / With bars: bytes labels are formatted via kb().
+    const withoutLine = lines.find((l) => /Without context-mode/.test(l));
+    const withLine    = lines.find((l) => /With context-mode/.test(l));
+    expect(withoutLine, `Without line missing:\n${text}`).toBeDefined();
+    expect(withLine,    `With line missing:\n${text}`).toBeDefined();
+
+    // Without ≈ 3 MB. 3,038,000 bytes / 1024^2 = 2.897 MB → kb() prints
+    // "2.9 MB". Pre-fix (SLICE B): 2898+140+2139 = 5177 KB → "5.1 MB".
+    expect(withoutLine!).toMatch(/(2\.9 MB|3\.0 MB|2,8\d\d KB|3,038 KB)/);
+    expect(withoutLine).not.toMatch(/5\.\d MB/);
+
+    // With ≈ 140 KB. 140,000 / 1024 = 136.7 KB → kb() prints "137 KB".
+    // Pre-fix (SLICE B): 140 + 2139 = 2279 KB → "2.2 MB".
+    expect(withLine!).toMatch(/13[67] KB|140 KB/);
+    expect(withLine).not.toMatch(/2\.\d MB/);
+  });
+});
+
+describe("v1.0.148 Bug G — empty-state branch (no degenerate bar)", () => {
+  test("bytesAvoided=0 AND bytesReturned=0 → skip Section 1 bars, emit honest hint", () => {
+    // Only event metadata captured — no redirects yet. SLICE B formula
+    // would render Without=50000, With=50000, ratio=0% — a degenerate
+    // flat bar. Strict formula skips the bar and emits a one-line hint.
+    const realBytes: RealBytesStats = {
+      eventDataBytes: 50_000,
+      bytesAvoided:        0,
+      bytesReturned:       0,
+      snapshotBytes:       0,
+      totalSavedTokens:    0,
+    };
+
+    const text = formatReport(strictReport(), "1.0.148", null, {
+      conversation: strictConversation(),
+      realBytes: { conversation: realBytes },
+      ...STRICT_OPTS,
+    });
+
+    const lines = text.split("\n");
+
+    // No Without/With bars in this empty state.
+    expect(lines.find((l) => /Without context-mode/.test(l)),
+      `Without bar should NOT render in empty state:\n${text}`).toBeUndefined();
+    expect(lines.find((l) => /With context-mode/.test(l)),
+      `With bar should NOT render in empty state:\n${text}`).toBeUndefined();
+
+    // And no "0% kept out" or "100% kept out" degenerate ratio line.
+    const ratioLine = lines.find((l) => /kept out of context/.test(l));
+    expect(ratioLine,
+      `degenerate ratio line should NOT render in empty state:\n${text}`).toBeUndefined();
+
+    // Honest hint must appear in Section 1.
+    expect(text).toMatch(/no measurable redirect activity/i);
   });
 });
