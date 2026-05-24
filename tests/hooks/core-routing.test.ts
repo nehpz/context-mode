@@ -88,9 +88,10 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect(result!.updatedInput).toBeDefined();
-      expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget blocked",
-      );
+      const cmd = (result!.updatedInput as Record<string, string>).command;
+      expect(cmd).toContain("curl/wget redirected");
+      expect(cmd).not.toContain("curl/wget blocked");
+      expect(cmd).toMatch(/retry/i);
     });
 
     it("denies Codex exec_command cmd payloads like Bash command payloads", () => {
@@ -104,7 +105,7 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget blocked",
+        "curl/wget redirected",
       );
     });
 
@@ -115,7 +116,7 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget blocked",
+        "curl/wget redirected",
       );
     });
 
@@ -194,9 +195,10 @@ describe("routePreToolUse", () => {
       });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
-      expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "Inline HTTP blocked",
-      );
+      const cmd = (result!.updatedInput as Record<string, string>).command;
+      expect(cmd).toContain("Inline HTTP redirected");
+      expect(cmd).not.toContain("Inline HTTP blocked");
+      expect(cmd).toMatch(/retry/i);
     });
 
     it("denies requests.get() with modify action", () => {
@@ -206,7 +208,7 @@ describe("routePreToolUse", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "Inline HTTP blocked",
+        "Inline HTTP redirected",
       );
     });
 
@@ -346,8 +348,13 @@ describe("routePreToolUse", () => {
       });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      // PR #654 substitute: imperative-positive framing, no "blocked" wording,
+      // explicit retry hint to keep Haiku-tier agents from capitulating to
+      // training data on transient DNS errors (audit Probe 3).
+      expect(result!.reason).toContain("WebFetch redirected");
+      expect(result!.reason).not.toContain("WebFetch blocked");
       expect(result!.reason).toContain("fetch_and_index");
+      expect(result!.reason).toMatch(/retry/i);
     });
 
     it("includes the URL in deny reason", () => {
@@ -362,7 +369,7 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("mcp_web_fetch", { url });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      expect(result!.reason).toContain("WebFetch redirected");
       expect(result!.reason).toContain("fetch_and_index");
       expect(result!.reason).toContain("ctx_search");
     });
@@ -372,7 +379,7 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("mcp_fetch_tool", { url });
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      expect(result!.reason).toContain("WebFetch redirected");
       expect(result!.reason).toContain("fetch_and_index");
       expect(result!.reason).toContain("ctx_search");
     });
@@ -601,26 +608,39 @@ describe("routePreToolUse", () => {
   // ─── Routing block content ──────────────────────────────
 
   describe("routing block content", () => {
-    it("contains file_writing_policy forbidding ctx_execute for file writes", () => {
+    // Wording rewritten per ADR-0002 (PR #683 follow-up): the original tests
+    // asserted negative framings (`NEVER use`, `NO …`, `NEVER inline`) that
+    // failed the cross-LLM safety-bias rubric (#9) and the prompt-surface
+    // forbidden-token contract in tests/core/server.test.ts. The new
+    // assertions cover the same semantic intent expressed positively:
+    //   - file writes go through the native Write/Edit tool
+    //   - ctx_execute / ctx_execute_file / Bash subprocesses do not persist edits
+    //   - artifacts get written to files (path + 1-line description returned)
+    it("file_writing_policy points file writes at native Write/Edit tools", () => {
       expect(ROUTING_BLOCK).toContain("<file_writing_policy>");
-      expect(ROUTING_BLOCK).toContain("NEVER use");
+      expect(ROUTING_BLOCK).toContain("File writes use the native Write or Edit tool");
+      // semantic intent: ctx_execute family must not be used for file writes —
+      // expressed positively as "do not persist edits to the host filesystem"
       expect(ROUTING_BLOCK).toContain("ctx_execute");
-      expect(ROUTING_BLOCK).toContain("native Write/Edit tools");
+      expect(ROUTING_BLOCK).toContain("do not persist edits");
     });
 
-    it("forbidden_actions blocks ctx_execute for file creation", () => {
-      expect(ROUTING_BLOCK).toContain(
-        "NO",
-      );
-      expect(ROUTING_BLOCK).toContain(
-        "for file creation/modification",
-      );
+    it("when_not_to_use redirects ctx_execute away from file creation", () => {
+      // Replaces the old `<forbidden_actions>` container; same semantic intent
+      // (do not pick ctx_execute for file creation) expressed via WHEN NOT.
+      expect(ROUTING_BLOCK).toContain("<when_not_to_use>");
+      expect(ROUTING_BLOCK).toContain("for file writes");
+      expect(ROUTING_BLOCK).toContain("analysis, processing, and computation only");
     });
 
-    it("artifact_policy specifies native Write tool", () => {
+    it("artifact_policy points artifacts at files with file-path return shape", () => {
+      // Replaces the old "Write artifacts ... NEVER inline" wording.
+      // The semantic intent — write artifacts to files, return only the path
+      // plus a 1-line description — is asserted via the positive surface.
       expect(ROUTING_BLOCK).toContain(
-        "Write artifacts (code, configs, PRDs) to FILES. NEVER inline.",
+        "Write artifacts (code, configs, PRDs) to files",
       );
+      expect(ROUTING_BLOCK).toContain("file path + 1-line description");
     });
   });
 

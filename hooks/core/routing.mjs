@@ -704,7 +704,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         return mcpRedirect({
           action: "modify",
           updatedInput: {
-            command: `echo "context-mode: curl/wget blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and prints only the answer. Or use ${t("ctx_fetch_and_index")}(url, source) to fetch and index. Write pure JS with try/catch, no npm deps. Do NOT retry with curl/wget."`,
+            command: `echo "context-mode: curl/wget redirected. Call ${t("ctx_execute")}(language, code) to fetch the URL, derive your answer in code, and print only the result — the raw HTTP body stays in the sandbox instead of entering your conversation. Or call ${t("ctx_fetch_and_index")}(url, source) when you want to query the response later via ${t("ctx_search")}. Both have full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)."`,
           },
           // D2 PRD Phase 3.1: marker payload for PostToolUse byte accounting.
           redirectMeta: {
@@ -735,7 +735,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       return mcpRedirect({
         action: "modify",
         updatedInput: {
-          command: `echo "context-mode: Inline HTTP blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and console.log() only the result. Write robust pure JS with try/catch, no npm deps. Do NOT retry with Bash."`,
+          command: `echo "context-mode: Inline HTTP redirected. Call ${t("ctx_execute")}(language, code) to fetch, derive your answer in code, and console.log() only the result — the raw response body stays in the sandbox instead of entering your conversation. Full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)."`,
         },
       });
     }
@@ -748,7 +748,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       return mcpRedirect({
         action: "modify",
         updatedInput: {
-          command: `echo "context-mode: Build tool redirected. Think in Code — use ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run and print only errors/summary. Do NOT retry with Bash."`,
+          command: `echo "context-mode: Build tool redirected. Call ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run the build and print only the tail — the verbose build log stays in the sandbox instead of entering your conversation. For more targeted output, replace \\"tail -30\\" with \\"grep -E '(error|warning|FAIL|✗|×)'\\" or similar, so only the lines that matter come back."`,
         },
       });
     }
@@ -801,7 +801,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     const url = toolInput.url ?? "";
     return mcpRedirect({
       action: "deny",
-      reason: `context-mode: WebFetch blocked. Think in Code — use ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch and index, then ${t("ctx_search")}(queries: [...]) to query. Or use ${t("ctx_execute")}(language, code) to fetch, process, and console.log() only what you need. Write pure JS, no npm deps. Do NOT use curl, wget, or WebFetch.`,
+      reason: `context-mode: WebFetch redirected. Call ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch + index the page, then ${t("ctx_search")}(queries: [...]) to query the indexed content — the raw page bytes stay in storage instead of entering your conversation. Or call ${t("ctx_execute")}(language, code) when you want to derive your answer in one round trip (parse, extract, count) without persisting the response. Both have full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH).`,
       // D2 PRD Phase 4.1: marker payload for PostToolUse byte accounting.
       redirectMeta: {
         tool: "WebFetch",
