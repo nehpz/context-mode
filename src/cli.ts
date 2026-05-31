@@ -1549,6 +1549,41 @@ async function upgrade(opts?: { platform?: string }) {
         });
       } catch { /* best effort — never block upgrade */ }
 
+      // Issue #710 — Layer 1: rewrite stale shell-snapshot PATH entries.
+      //
+      // Claude Code's per-session shell snapshot
+      // (~/.claude/shell-snapshots/snapshot-*.sh, baked at session boot —
+      // refs/platforms/claude-code/src/utils/bash/ShellSnapshot.ts:269-336)
+      // is `source`d before every Bash tool call. It contains an
+      // `export PATH='…'` line including the context-mode `bin/` for the
+      // version active at session start. /ctx-upgrade deletes the old
+      // cache dir mid-session — the snapshot still points at it, so every
+      // Bash call fails with "Plugin directory does not exist" until the
+      // session restarts. Layer 1 fixes the active session immediately;
+      // Layer 2 (sessionstart.mjs) heals any session that started before
+      // /ctx-upgrade ran.
+      //
+      // claude-code only — no other adapter uses shell-snapshots. Skip
+      // when running under a non-claude-code adapter (Codex/Cursor/Gemini
+      // etc. spawn Bash differently and have no `~/.claude/shell-snapshots`
+      // tree). Best-effort, idempotent, never throws.
+      try {
+        if (detection.platform === "claude-code") {
+          const { rewriteShellSnapshots } = await import(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            "../hooks/cache-heal-utils.mjs" as any
+          ) as { rewriteShellSnapshots: (opts: { snapshotsDir: string; currentVersion: string }) => { rewritten: string[] } };
+          const snapshotsDir = resolve(resolveClaudeConfigDir(), "shell-snapshots");
+          const result = rewriteShellSnapshots({
+            snapshotsDir,
+            currentVersion: newVersion,
+          });
+          if (result.rewritten.length > 0) {
+            p.log.info(color.dim(`  Healed ${result.rewritten.length} stale shell snapshot(s) — Bash tool calls in the active session will pick up v${newVersion} immediately`));
+          }
+        }
+      } catch { /* best effort — never block upgrade */ }
+
       s.stop(color.green(`Updated in-place to v${newVersion}`));
 
       // v1.0.114 hotfix — pre-flight: verify the in-place copy actually
