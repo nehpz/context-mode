@@ -415,6 +415,37 @@ interface ParsedGit {
   operation: string | null;
 }
 
+/**
+ * Gap #2 (16-oss-verify-gap-prd) — expand leading `~` / `~/` to homedir.
+ * Does NOT support `~user/path` (no current-user resolution at bridge
+ * layer; that requires a passwd lookup). Returns input unchanged when
+ * there is no tilde or the path starts with `~<otheruser>`.
+ */
+function expandHomeTilde(path: string): string {
+  if (typeof path !== "string" || path.length === 0) return path;
+  if (path === "~") return getHomedirSafe();
+  if (path.startsWith("~/")) return getHomedirSafe() + path.slice(1);
+  return path;
+}
+
+/**
+ * Lazily-resolved homedir — avoids a require/import at module init time.
+ * Falls back to "~" (no-op expansion) when the environment is sandboxed
+ * without HOME / USERPROFILE.
+ */
+function getHomedirSafe(): string {
+  try {
+    const home = process.env.HOME
+      || process.env.USERPROFILE
+      || (process.env.HOMEDRIVE && process.env.HOMEPATH
+          ? process.env.HOMEDRIVE + process.env.HOMEPATH
+          : "");
+    return home || "~";
+  } catch {
+    return "~";
+  }
+}
+
 function parseGitInvocation(cmd: string): ParsedGit | null {
   const tokens = tokenizeCommand(cmd);
   let i = 0;
@@ -439,6 +470,12 @@ function parseGitInvocation(cmd: string): ParsedGit | null {
       i += 2;
       continue;
     }
+    // Gap #2 — `--directory=/path` equals-form (tokenizer keeps it as one)
+    if (t.startsWith("--directory=")) {
+      scopedDir = t.slice("--directory=".length);
+      i++;
+      continue;
+    }
     if (t.length > 0 && t[0] === "-") {
       // Generic flag — skip the flag itself. We do NOT consume the next
       // token as its value generically because git's per-flag arg shape
@@ -451,6 +488,7 @@ function parseGitInvocation(cmd: string): ParsedGit | null {
     operation = t;
     break;
   }
+  if (scopedDir) scopedDir = expandHomeTilde(scopedDir);
   return { scopedDir, operation };
 }
 
@@ -1301,9 +1339,61 @@ function extractFileReadMetadata(input: HookInput): SessionEvent[] {
 }
 
 /**
+ * Per-model USD price table — Anthropic public list pricing, $/MTok.
+ * Verified against platform.claude.com/docs/en/about-claude/pricing
+ * (2026-06 cache: 5-min cache_write = 1.25× input, cache_read = 0.10× input).
+ *
+ * NOTE: 16-oss-verify-gap-prd Gap #1 quoted Opus at $15/$75 — that is the
+ * old Opus 4 (non-4.7) rate. Opus 4.7 ships at $5/$25 (CloudZero, finout.io,
+ * platform.claude.com all confirm).
+ */
+const MODEL_PRICING_USD_PER_MTOK: Record<string, {
+  input: number;
+  output: number;
+  cache_write: number;
+  cache_read: number;
+}> = {
+  "claude-opus-4-7":   { input: 5.00, output: 25.00, cache_write: 6.25, cache_read: 0.50 },
+  "claude-sonnet-4-6": { input: 3.00, output: 15.00, cache_write: 3.75, cache_read: 0.30 },
+  "claude-haiku-4-5":  { input: 1.00, output:  5.00, cache_write: 1.25, cache_read: 0.10 },
+  default:             { input: 3.00, output: 15.00, cache_write: 3.75, cache_read: 0.30 },
+};
+
+function resolveModelKey(input: HookInput, parsedResp: Record<string, unknown>): string {
+  const candidates: unknown[] = [
+    input.tool_input?.model,
+    (input as unknown as Record<string, unknown>).model,
+    parsedResp.model,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) {
+      return c in MODEL_PRICING_USD_PER_MTOK ? c : "default";
+    }
+  }
+  return "default";
+}
+
+function computeCostUsd(
+  modelKey: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheCreationTokens: number,
+  cacheReadTokens: number,
+): number {
+  const price = MODEL_PRICING_USD_PER_MTOK[modelKey] ?? MODEL_PRICING_USD_PER_MTOK.default;
+  const totalMicroDollars =
+    inputTokens * price.input +
+    outputTokens * price.output +
+    cacheCreationTokens * price.cache_write +
+    cacheReadTokens * price.cache_read;
+  return totalMicroDollars / 1_000_000;
+}
+
+/**
  * AgentOutput.usage capture — fires on the Task sub-agent dispatcher.
- * Captures the 7 cost/perf fields from sdk-tools.d.ts:64-75. The platform
- * persists these as typed columns post-release; the bridge emits them as
+ * Captures the 7 cost/perf fields from sdk-tools.d.ts:64-75. Derives
+ * cost_usd from per-model pricing (Gap #1 fix). The platform persists
+ * these as typed columns post-release; the bridge emits them as
  * structured tokens in event.data for forward-compatible ingestion.
  */
 function extractAgentUsage(input: HookInput): SessionEvent[] {
@@ -1341,6 +1431,24 @@ function extractAgentUsage(input: HookInput): SessionEvent[] {
   }
   if (typeof usage.service_tier === "string") {
     parts.push(`tier:${usage.service_tier.slice(0, 32)}`);
+  }
+
+  // Gap #1 (16-oss-verify-gap-prd) — derive cost_usd from per-model pricing
+  // when at least one token count is present. Zero-token case skips cost
+  // so dashboard never shows misleading "$0.00 for nothing" rows.
+  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+  const cacheCreate = typeof usage.cache_creation_input_tokens === "number"
+    ? usage.cache_creation_input_tokens
+    : 0;
+  const cacheRead = typeof usage.cache_read_input_tokens === "number"
+    ? usage.cache_read_input_tokens
+    : 0;
+  const anyTokens = inputTokens > 0 || outputTokens > 0 || cacheCreate > 0 || cacheRead > 0;
+  if (anyTokens) {
+    const modelKey = resolveModelKey(input, out);
+    const cost = computeCostUsd(modelKey, inputTokens, outputTokens, cacheCreate, cacheRead);
+    parts.push(`cost_usd:${cost.toFixed(6).replace(/0+$/, "").replace(/\.$/, ".0")}`);
   }
 
   return [{

@@ -139,4 +139,112 @@ describe("extractAgentUsage — Issue #4 AgentOutput.usage capture", () => {
     expect(events.some((e) => e.type === "task")).toBe(true);
     expect(events.filter((e) => e.type === "agent_usage").length).toBe(0);
   });
+
+  // Gap #1 (16-oss-verify-gap-prd §2) — cost_usd derivation
+  test("cost_usd: Sonnet pricing 1000 input + 500 output → 0.0105", () => {
+    const events = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-sonnet-4-6" },
+      tool_response: JSON.stringify({
+        totalTokens: 1500,
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    expect(events.length).toBe(1);
+    expect(events[0].data).toMatch(/cost_usd:0\.0105/);
+  });
+
+  test("cost_usd: Opus 4.7 pricing higher than Sonnet 4.6 for same tokens", () => {
+    const opus = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-opus-4-7" },
+      tool_response: JSON.stringify({
+        totalTokens: 1500,
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    const sonnet = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-sonnet-4-6" },
+      tool_response: JSON.stringify({
+        totalTokens: 1500,
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    const opusCost = Number(opus[0].data.match(/cost_usd:(\d+\.\d+)/)![1]);
+    const sonnetCost = Number(sonnet[0].data.match(/cost_usd:(\d+\.\d+)/)![1]);
+    // Opus 4.7 is $5/$25 vs Sonnet 4.6 $3/$15 — Opus runs ~1.67x Sonnet
+    expect(opusCost).toBeGreaterThan(sonnetCost);
+    expect(opusCost).toBeCloseTo(0.0175, 4);
+  });
+
+  test("cost_usd: Haiku pricing lower than Sonnet", () => {
+    const haiku = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-haiku-4-5" },
+      tool_response: JSON.stringify({
+        totalTokens: 1500,
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    const haikuCost = Number(haiku[0].data.match(/cost_usd:(\d+\.\d+)/)![1]);
+    expect(haikuCost).toBeLessThan(0.01);
+  });
+
+  test("cost_usd: cache_creation + cache_read priced separately", () => {
+    const events = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-sonnet-4-6" },
+      tool_response: JSON.stringify({
+        totalTokens: 4000,
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 500,
+          cache_creation_input_tokens: 1000,
+          cache_read_input_tokens: 1500,
+        },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    expect(events.length).toBe(1);
+    // Expected: 1000*3 + 500*15 + 1000*3.75 + 1500*0.30 = 3000+7500+3750+450 = 14700
+    // 14700 / 1_000_000 = 0.0147
+    expect(events[0].data).toMatch(/cost_usd:0\.0147/);
+  });
+
+  test("cost_usd: unknown model falls back to default Sonnet pricing", () => {
+    const events = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-future-model-99" },
+      tool_response: JSON.stringify({
+        totalTokens: 1500,
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    expect(events[0].data).toMatch(/cost_usd:0\.0105/);
+  });
+
+  test("cost_usd: no model + token counts → still computes with default pricing", () => {
+    const events = extractEvents({
+      tool_name: "Task",
+      tool_input: {},
+      tool_response: JSON.stringify({
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    expect(events[0].data).toMatch(/cost_usd:/);
+  });
+
+  test("cost_usd: zero tokens → cost_usd:0 not emitted (skip)", () => {
+    const events = extractEvents({
+      tool_name: "Task",
+      tool_input: { model: "claude-sonnet-4-6" },
+      tool_response: JSON.stringify({
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }),
+    }).filter((e) => e.type === "agent_usage");
+    // Either no event OR an event without cost_usd
+    if (events.length > 0) {
+      expect(events[0].data).not.toMatch(/cost_usd:/);
+    }
+  });
 });
