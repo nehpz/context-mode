@@ -381,6 +381,27 @@ pre code{overflow-wrap:normal;word-break:normal;white-space:pre}
 .final-cta .pri{background:#4b7bec;color:#fff}.final-cta .pri:hover{background:#3b6dd9;text-decoration:none}
 .final-cta .sec{color:#cbd5e1;border:1px solid #1e2a3a}.final-cta .sec:hover{border-color:#4b7bec;text-decoration:none}
 
+/* ── Pricing chapter ── */
+.pricing-card{border:1px solid var(--border);border-radius:16px;padding:48px 40px;background:var(--bg-alt);max-width:540px;margin:32px auto}
+.pricing-card .plan-name{font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--text-3);font-size:13px;margin:0 0 8px}
+.pricing-card .plan-price{margin:0;line-height:1;color:var(--text)}
+.pricing-card .plan-price strong{font-family:var(--serif);font-size:64px;font-weight:600;letter-spacing:-.04em;color:var(--text)}
+.pricing-card .plan-period{color:var(--text-3);font-size:18px;margin-left:6px;font-weight:400}
+.pricing-card .plan-features{list-style:none;padding:0;margin:32px 0;font-size:14.5px;color:var(--text-2)}
+.pricing-card .plan-features li{padding:10px 0;border-bottom:1px dashed var(--border-light)}
+.pricing-card .plan-features li:last-child{border-bottom:0}
+.pricing-card .pricing-cta{display:block;text-align:center;padding:16px;background:var(--text);color:#fff;text-decoration:none;border-radius:10px;font-weight:700;margin-top:24px;transition:.15s}
+.pricing-card .pricing-cta:hover{background:var(--accent-dark);text-decoration:none}
+.pricing-card .pricing-fine{color:var(--text-3);font-size:13px;margin-top:20px;line-height:1.5}
+.pricing-deny-list{margin:48px auto 0;padding:32px;background:var(--bg-warm);border-radius:12px;max-width:540px}
+.pricing-deny-list .kicker{margin-bottom:10px}
+.pricing-deny-list p{color:var(--text-2);font-size:14.5px;line-height:1.65;margin:0}
+@media (max-width:640px){
+  .pricing-card{padding:32px 22px}
+  .pricing-card .plan-price strong{font-size:48px}
+  .pricing-deny-list{padding:24px 20px}
+}
+
 /* ── Footer ── */
 footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top:1px solid var(--border-light)}
 .footer-q{font-family:var(--serif);font-size:clamp(1.3rem,3vw,1.8rem);font-style:italic;color:var(--text);line-height:1.35;max-width:680px;margin:0 auto 24px;padding:0 24px}
@@ -1233,7 +1254,47 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
     <p class="muted rev" style="margin-top:24px">Member-scope reads bypass org-aggregate whitelist filters — a member's full activity counts toward their personal KPIs even when their project is pending org review. Defense at the schema layer, not the controller.</p>
 
     <div class="gtm-strip rev">
-      <a href="#waitlist" class="cta pri">Join the waitlist</a>
+      <a href="https://platform.context-mode.com/signup" class="cta pri">Start for $20 / seat →</a>
+    </div>
+  </div>
+</section>
+
+<hr class="sep">
+
+<!-- ═══════════════════════════════════════ PRICING ═══════════════════════════════════════ -->
+<section class="chapter" id="pricing">
+  <div class="wrap">
+    <div class="rev" style="max-width:880px">
+      <p class="section-num">§ 11 · pricing</p>
+      <p class="kicker">Pricing</p>
+      <h2 class="h2">One tier. Twenty dollars per seat. Predictable.</h2>
+      <div class="rule"></div>
+      <p class="lead">No annual variant. No volume discount. No founder discount. No grandfathering. Same band as Cursor Pro, GitHub Copilot Business, Vercel Pro &mdash; the AI-dev-tool tier you already budget for.</p>
+    </div>
+
+    <div class="pricing-card rev">
+      <p class="plan-name">Pro</p>
+      <p class="plan-price"><strong>$20</strong><span class="plan-period"> / seat / month</span></p>
+
+      <ul class="plan-features">
+        <li>222 patterns evaluated at org scope</li>
+        <li>MCP scopes &mdash; self, team, org</li>
+        <li>All 14 adapters supported</li>
+        <li>90-day data retention</li>
+        <li>Org Projects, Members, Teams, Untracked Activity</li>
+        <li>Persona views &mdash; Owner, Manager, Member</li>
+        <li>Email support (24-hour SLA)</li>
+        <li>Public cloud at platform.context-mode.com</li>
+      </ul>
+
+      <a class="pricing-cta" href="https://platform.context-mode.com/signup">Start for $20 / seat →</a>
+
+      <p class="pricing-fine">Per-seat means per member of your org (active or invited). Billed monthly. No annual variant, no volume discount, no free tier, no trial. Cancel any time via the Stripe Customer Portal &mdash; no refunds for the current period.</p>
+    </div>
+
+    <div class="pricing-deny-list rev">
+      <p class="kicker">What this is not</p>
+      <p>No SSO. No SOC 2 report. No on-prem option. No dedicated support contract. If your buying process needs any of those, run the OSS collector self-hosted (free) and we will revisit Enterprise after the first Series A.</p>
     </div>
   </div>
 </section>
