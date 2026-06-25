@@ -1545,6 +1545,14 @@ export interface AgentUsageCounts {
   native_cost_usd?: number | null;
 }
 
+// ── Kimi Code (kimi-code) usage parsers ────────────────────────────────────
+// Implementation lives in src/adapters/kimi/usage.ts (per adapter ownership);
+// re-exported here so the hook-reachable session-extract bundle can import the
+// cursor-gated wire.jsonl reader without a separate per-adapter bundle. The
+// import is type-only-free (runtime callees buildAgentUsageEvent are hoisted),
+// so the extract.ts <-> usage.ts cycle is load-order safe.
+export { parseKimiUsage, extractKimiUsageSince } from "../adapters/kimi/usage.js";
+
 /**
  * Pi (oh-my-pi) per-turn usage parser.
  *
