@@ -22,6 +22,15 @@ git remote add upstream https://github.com/mksglu/context-mode.git
 git config rerere.enabled true
 ```
 
+## Runtime wiring (how omp loads THIS clone)
+
+omp loads plugins from `~/.omp/plugins/node_modules/<name>` via that directory's bun `package.json`. An npm-registry install there shadows the fork — the bridge never loads. The fork is wired in two places:
+
+1. **Plugin slot → symlink to this clone.** `~/.omp/plugins/package.json` declares `"context-mode": "link:/Users/stephen/Projects/nehpz/context-mode"` and `~/.omp/plugins/node_modules/context-mode` is a symlink here (npm copy kept at `~/.omp/plugins/context-mode.npm-1.0.169.bak`). omp reads this clone's `omp.extensions` → loads `build/adapters/omp/plugin.js` then `bridge.js`. Rebuilds propagate on the next omp restart; no reinstall.
+2. **MCP server → this clone's bundle.** `~/.omp/agent/mcp.json` runs `node /Users/stephen/Projects/nehpz/context-mode/server.bundle.mjs` (NOT the bare `context-mode` command — on this machine that resolves to a vite-plus shim, not the fork).
+
+Do not run `omp plugin install context-mode` or let anything "heal" the plugin dir back to the npm registry copy — that silently drops the bridge. After each sync + build, restart omp to pick up the new build output.
+
 ## Sync ritual (merge-based; never rebase)
 
 1. `git fetch upstream && git merge upstream/main`
