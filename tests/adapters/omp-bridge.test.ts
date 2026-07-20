@@ -394,4 +394,46 @@ describe("OMP bridge", () => {
       expect(count()).toBe(before);
     });
   });
+
+  // ═══════════════════════════════════════════════════════════
+  // Slice 7: post-shutdown reuse (same-process second session)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Slice 7: post-shutdown reuse", () => {
+    it("a second session after session_shutdown regains DB-backed behavior", async () => {
+      const bridge = await registerBridge(api);
+      await api._trigger("session_start", { type: "session_start" }, SESSION_CTX);
+      await api._trigger("session_shutdown", {});
+
+      // Second session in the same process, different session file.
+      const secondCtx = {
+        sessionManager: { getSessionFile: () => "/tmp/omp-bridge-test-session-2.jsonl" },
+      };
+      await api._trigger("session_start", { type: "session_start" }, secondCtx);
+      const secondId = bridge._getOmpBridgeSessionIdForTests();
+      expect(secondId).toHaveLength(16);
+
+      await api._trigger(
+        "before_agent_start",
+        { prompt: "Always run the linter before committing changes." },
+        {},
+      );
+
+      const db = openDb(tempDir);
+      try {
+        const events = db.getEvents(secondId);
+        expect(events.length).toBeGreaterThan(0);
+        expect(events.every((e) => e.source_hook === "UserPromptSubmit")).toBe(true);
+      } finally {
+        db.close();
+      }
+
+      const stats = (await api._commands["ctx-stats"].handler()) as { text: string };
+      expect(stats.text).toContain("Events captured");
+
+      const calls: string[] = [];
+      await api._trigger("agent_end", {}, { ui: { setStatus: (_k: string, t: string) => calls.push(t) } });
+      expect(calls.length).toBe(1);
+    });
+  });
 });

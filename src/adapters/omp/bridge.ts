@@ -161,28 +161,51 @@ async function ensureSecurityInit(routing: RoutingModule): Promise<void> {
 
 // ── mapDecision (KTD7) ───────────────────────────────────
 // deny → {block, reason}; context/redirect guidance → pending-context queue;
-// modify/ask → accepted parity gap (OMP tool_call results carry no input
-// mutation or ask affordance) — allow and log once.
+// modify carrying redirect guidance → block with the guidance as the reason
+// (OMP cannot mutate tool input, so blocking-with-guidance is the closest
+// fidelity to Claude's command rewrite); bare modify/ask → accepted parity
+// gap — allow and log once.
 function mapDecision(decision: RoutingDecision | null | undefined): { block: boolean; reason?: string } | undefined {
   if (decision?.additionalContext) queueContext(decision.additionalContext);
   if (!decision?.action) return undefined;
   switch (decision.action) {
     case "deny":
       return { block: true, reason: decision.reason ?? "Blocked by context-mode routing policy." };
-    case "modify":
-    case "ask":
-      if (!_modifyGapLogged) {
-        _modifyGapLogged = true;
-        try {
-          process.stderr.write(
-            `context-mode omp bridge: '${decision.action}' routing decisions are an accepted parity gap on OMP (no tool-input mutation API); allowing tool call.\n`,
-          );
-        } catch { /* best effort */ }
+    case "modify": {
+      // routing.mjs redirects rewrite the command to `echo "<guidance>"` so
+      // the model sees steering instead of the raw output. Extract that
+      // guidance and deliver it as the block reason.
+      const command = typeof decision.updatedInput?.command === "string" ? decision.updatedInput.command : "";
+      const echoMatch = command.match(/^echo\s+"([\s\S]+)"\s*$/);
+      if (echoMatch) {
+        return { block: true, reason: echoMatch[1] };
       }
-      return undefined;
+      if (decision.redirectMeta) {
+        return {
+          block: true,
+          reason:
+            "context-mode: this call was redirected. Use ctx_execute / ctx_fetch_and_index so the raw output stays out of the context window.",
+        };
+      }
+      return logDecisionGap("modify");
+    }
+    case "ask":
+      return logDecisionGap("ask");
     default:
       return undefined;
   }
+}
+
+function logDecisionGap(action: string): undefined {
+  if (!_modifyGapLogged) {
+    _modifyGapLogged = true;
+    try {
+      process.stderr.write(
+        `context-mode omp bridge: '${action}' routing decisions without redirect guidance are an accepted parity gap on OMP (no tool-input mutation API); allowing tool call.\n`,
+      );
+    } catch { /* best effort */ }
+  }
+  return undefined;
 }
 
 function queueContext(text: string): void {
@@ -292,7 +315,9 @@ export interface OmpBridgeHookAPI {
 // ── Bridge entry point ───────────────────────────────────
 export default function ompBridge(pi: OmpBridgeHookAPI): void {
   const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
-  const db = getOrCreateDB(projectDir);
+  // No captured DB handle: session_shutdown closes the singleton, so every
+  // DB-using handler reacquires via getOrCreateDB (cheap path-compare reopen).
+  getOrCreateDB(projectDir);
 
   // ── session_start — rebind bridge session ID (never ensureSession: R5) ──
   pi.on("session_start", (_event: unknown, ctx: HookEventCtx) => {
@@ -309,6 +334,7 @@ export default function ompBridge(pi: OmpBridgeHookAPI): void {
     try {
       _pendingContext = "";
       if (!_sessionId) return undefined;
+      const db = getOrCreateDB(projectDir);
 
       // U3 — user-prompt capture. Upstream records no UserPromptSubmit rows;
       // these are bridge-owned (verified against plugin.ts before adding).
@@ -334,11 +360,15 @@ export default function ompBridge(pi: OmpBridgeHookAPI): void {
         "Stats → ctx_stats. Doctor → ctx_doctor.",
       );
 
-      // U2 — security fail-open warning (populated after U4's lazy init).
+      // U2 — security fail-open warning. Init here (not only on tool_call) so
+      // a missing security module surfaces on the same turn, not one late.
       const routing = await getRouting();
-      if (routing && routing.isSecurityInitFailed()) {
-        const warning = routing.buildSecurityWarningContext();
-        if (warning) parts.push(warning);
+      if (routing) {
+        await ensureSecurityInit(routing);
+        if (routing.isSecurityInitFailed()) {
+          const warning = routing.buildSecurityWarningContext();
+          if (warning) parts.push(warning);
+        }
       }
 
       // U5 — active_memory steering from events upstream captured (read-only).
@@ -417,9 +447,9 @@ export default function ompBridge(pi: OmpBridgeHookAPI): void {
   // ── agent_end — status display (writes nothing; KTD4) ──
   pi.on("agent_end", (_event: unknown, ctx: HookEventCtx) => {
     try {
-      if (!_sessionId || !_db) return undefined;
+      if (!_sessionId) return undefined;
       const ui = (ctx as StatusUiCtx | undefined)?.ui;
-      ui?.setStatus?.("context-mode", buildStatusText(_db, _sessionId));
+      ui?.setStatus?.("context-mode", buildStatusText(getOrCreateDB(projectDir), _sessionId));
     } catch { /* best effort */ }
     return undefined;
   });
@@ -443,8 +473,9 @@ export default function ompBridge(pi: OmpBridgeHookAPI): void {
   pi.registerCommand?.("ctx-stats", {
     description: "Show context-mode session statistics",
     handler: async () => {
-      const text =
-        !_db || !_sessionId ? "context-mode: no active session" : buildStatsText(_db, _sessionId);
+      const text = !_sessionId
+        ? "context-mode: no active session"
+        : buildStatsText(getOrCreateDB(projectDir), _sessionId);
       return { text };
     },
   });
