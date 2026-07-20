@@ -44,7 +44,8 @@
     "name": "context-mode",
     "description": "Save 98% of your context window in OMP — sandboxed code execution, FTS5 search, hard-block curl/wget, session continuity across compaction.",
     "extensions": [
-      "./build/adapters/omp/plugin.js"
+      "./build/adapters/omp/plugin.js",
+      "./build/adapters/omp/bridge.js"
     ]
   },
   "bugs": "https://github.com/mksglu/context-mode/issues",
